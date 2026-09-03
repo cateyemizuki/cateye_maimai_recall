@@ -1,0 +1,8 @@
+# 运行时配置由 Runner 生成，禁止提交
+/config.toml
+
+__pycache__/
+*.py[cod]
+
+# Issue 提交文档（本地使用，不随插件上传）
+/ISSUE_SUBMISSION.md
