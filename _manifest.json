@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "github.cateye.maimai-recall",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "name": "麦麦撤回",
   "description": "为机器人提供消息撤回能力：LLM 工具按消息 ID 撤回指定消息；引用一条消息发送「/撤回」即可撤回被引用的消息；失败时返回具体原因（权限不足、超过时间限制、消息不存在等）。",
   "author": { "name": "cateye", "url": "https://github.com/cateyemizuki" },

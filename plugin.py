@@ -21,7 +21,7 @@ from typing import Any, ClassVar
 from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase, Tool
 from maibot_sdk.types import CONFIG_RELOAD_SCOPE_SELF, ToolParamType, ToolParameterInfo
 
-SUPPORTED_CONFIG_VERSION = "0.1.0"  # 与 _manifest.json 的 version 保持同步
+SUPPORTED_CONFIG_VERSION = "0.1.1"  # 与 _manifest.json 的 version 保持同步
 
 # QQ 消息 ID 是带符号 int32，负数合法，不能做正整数校验
 _NUMERIC_ID_RE = re.compile(r"-?\d+")
@@ -94,22 +94,34 @@ def translate_delete_error(wording: Any, *, fallback: str, target_is_bot_own: bo
 
 
 class PluginSectionConfig(PluginConfigBase):
-    """插件基础配置。"""
+    """插件基础配置（plugin 配置节）。"""
 
     __ui_label__ = "插件"
     __ui_icon__ = "undo"
     __ui_order__ = 0
 
-    enabled: bool = Field(default=True, description="是否启用插件")
+    enabled: bool = Field(
+        default=True,
+        description="是否启用插件",
+        json_schema_extra={
+            "label": "启用插件",
+            "hint": "插件总开关",
+        },
+    )
     config_version: str = Field(
         default=SUPPORTED_CONFIG_VERSION,
         description="配置版本（与插件版本同步）",
-        json_schema_extra={"hidden": True, "disabled": True},
+        json_schema_extra={
+            "hidden": True,
+            "disabled": True,
+            "label": "配置版本",
+            "hint": "配置版本，勿改",
+        },
     )
 
 
 class RecallRuleConfig(PluginConfigBase):
-    """撤回权限规则。"""
+    """撤回权限规则（rules 配置节）。"""
 
     __ui_label__ = "撤回规则"
     __ui_icon__ = "shield"
@@ -118,25 +130,41 @@ class RecallRuleConfig(PluginConfigBase):
     admin_users: list[str] = Field(
         default_factory=list,
         description="管理员用户 ID 列表，可以撤回任何消息；支持 '123456' 或 'qq:123456' 两种写法",
+        json_schema_extra={
+            "label": "管理员列表",
+            "hint": "管理员可撤任何消息",
+        },
     )
     users_can_recall_bot_messages: bool = Field(
         default=True,
         description="允许普通用户让机器人撤回机器人自己发出的消息（仍受时间限制约束）",
+        json_schema_extra={
+            "label": "允许撤回机器人的消息",
+            "hint": "允许撤回机器人消息",
+        },
     )
     users_can_recall_own_messages: bool = Field(
         default=False,
         description="允许普通用户撤回自己发出的消息（需要机器人具备群管理员身份，否则协议端会拒绝）",
+        json_schema_extra={
+            "label": "允许撤回自己的消息",
+            "hint": "允许撤回自己消息",
+        },
     )
     self_recall_time_limit_sec: int = Field(
         default=120,
         ge=1,
         le=86400,
         description="机器人撤回自己消息的时间限制（秒）；QQ 平台限制为 2 分钟，机器人是群管理员时不受限",
+        json_schema_extra={
+            "label": "撤回时限（秒）",
+            "hint": "撤回自身时限（秒）",
+        },
     )
 
 
 class AdapterApiConfig(PluginConfigBase):
-    """适配器接口设置。"""
+    """适配器接口设置（adapter 配置节）。"""
 
     __ui_label__ = "适配器接口"
     __ui_icon__ = "cable"
@@ -145,6 +173,10 @@ class AdapterApiConfig(PluginConfigBase):
     action_api: str = Field(
         default="adapter.napcat.action.call",
         description="适配器通用 action 调用 API 名；撤回与消息查询都通过它转发给协议端",
+        json_schema_extra={
+            "label": "适配器 action API",
+            "hint": "适配器 action 接口",
+        },
     )
 
 

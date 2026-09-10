@@ -6,3 +6,9 @@ __pycache__/
 
 # Issue 提交文档（本地使用，不随插件上传）
 /ISSUE_SUBMISSION.md
+
+# 测试代码（本地开发用，不随插件上传）
+test/
+tests/
+test_*.py
+*_test.py
