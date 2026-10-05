@@ -10,29 +10,51 @@
 
 - 非管理员撤回他人消息 → "你不是管理员，不能撤回他人的消息。"
 - 机器人自身的消息超过时限 → "这条消息已经发出超过 2 分钟，无法撤回了。"
+- 非管理员撤回其他会话的消息 → "这条消息不属于当前会话，只能撤回本会话内的消息。"
+
+安全边界：非管理员只能在触发会话内撤回（目标消息的归属会话与触发会话比对
+一致才放行，归属查询不到时一律拒绝）；管理员不受会话限制。
 """
 
 from __future__ import annotations
 
 import re
 import time
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Dict
 
 from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase, Tool
 from maibot_sdk.types import CONFIG_RELOAD_SCOPE_SELF, ToolParamType, ToolParameterInfo
 
-SUPPORTED_CONFIG_VERSION = "0.1.1"  # 与 _manifest.json 的 version 保持同步
+try:  # 管理员判定统一模块（复制自 cateye_common，随插件分发）
+    from .admin_util import collect_admins
+except ImportError:  # 平铺目录加载时无包上下文
+    from admin_util import collect_admins
+
+
+def _ui_i18n(en_label: str, en_hint: str = "") -> Dict[str, Dict[str, str]]:
+    """字段级英文翻译（并入 json_schema_extra；WebUI 按 i18n[locale]['label'/'hint'] 取用）。"""
+    entry: Dict[str, str] = {"label": en_label}
+    if en_hint:
+        entry["hint"] = en_hint
+    return {"i18n": {"en": entry}}
+
+SUPPORTED_CONFIG_VERSION = "0.1.3"  # 与 _manifest.json 的 version 保持同步
 
 # QQ 消息 ID 是带符号 int32，负数合法，不能做正整数校验
 _NUMERIC_ID_RE = re.compile(r"-?\d+")
 
 # 统一的结果文案（Command 与 Tool 共用，保证两边说法一致）
 REASON_SUCCESS = "已撤回该消息。"
+REASON_ASYNC_PENDING = "撤回请求已提交处理，是否成功待确认。"
 REASON_NO_TARGET = "请先引用一条消息再使用「/撤回」，或在命令后面附上消息 ID。"
 REASON_NOT_FOUND = "没有找到这条消息，它可能不存在或已经被撤回了。"
 REASON_NO_PERMISSION_OTHERS = "你不是管理员，不能撤回他人的消息。"
+REASON_SCOPE_MISMATCH = "这条消息不属于当前会话，只能撤回本会话内的消息。"
+REASON_TOO_FREQUENT = "操作太频繁了，请稍等片刻再试。"
 REASON_BOT_NOT_ADMIN = "机器人不是群管理员，无法撤回他人的消息。"
 REASON_BOT_MSG_ADMIN_ONLY = "只有管理员才能让机器人撤回它自己的消息。"
+REASON_ADAPTER_FAILED = "撤回接口调用失败，请确认平台适配器（如 Napcat 适配器）已安装并启用。"
+REASON_REJECTED_GENERIC = "撤回失败：协议端拒绝了这次撤回。"
 
 _PERMISSION_KEYWORDS = ("权限", "管理员", "denied", "permission", "forbidden", "not admin", "authority")
 _MISSING_KEYWORDS = ("找不到", "不存在", "已撤回", "not found", "no message", "invalid message", "not exist", "already recall")
@@ -61,11 +83,18 @@ def parse_timestamp(value: Any) -> float | None:
 
 
 def napcat_ok(resp: dict[str, Any]) -> bool:
-    """判断协议端原始响应是否成功（status==ok 或 retcode==0；async 视为已受理）。"""
+    """判断协议端原始响应是否明确成功（status==ok 或 retcode==0；async 不算成功）。"""
     status = str(resp.get("status") or "").strip().lower()
-    if status in ("ok", "async"):
+    if status == "ok":
         return True
+    if status == "async":  # 仅表示请求已受理，结果未知，不能当成功
+        return False
     return str(resp.get("retcode")).strip() == "0"
+
+
+def napcat_pending(resp: dict[str, Any]) -> bool:
+    """判断协议端响应是否为「已受理、结果未知」（status==async）。"""
+    return str(resp.get("status") or "").strip().lower() == "async"
 
 
 def format_duration(limit_sec: int) -> str:
@@ -79,7 +108,10 @@ def too_old_text(limit_sec: int) -> str:
 
 
 def translate_delete_error(wording: Any, *, fallback: str, target_is_bot_own: bool) -> str:
-    """把协议端撤回失败的错误信息翻译成给用户看的原因。"""
+    """把协议端撤回失败的错误信息翻译成给用户看的原因。
+
+    只输出分类原因，不回显协议端原始文案（原文由调用方写入日志）。
+    """
     text = str(wording or "").strip()
     lower = text.lower()
     if any(k in text or k in lower for k in _PERMISSION_KEYWORDS):
@@ -90,7 +122,7 @@ def translate_delete_error(wording: Any, *, fallback: str, target_is_bot_own: bo
         return REASON_NOT_FOUND
     if any(k in text or k in lower for k in _EXPIRED_KEYWORDS):
         return "这条消息已经超出可撤回的时间范围，无法撤回了。"
-    return fallback if not text else f"撤回失败：{text}"
+    return fallback
 
 
 class PluginSectionConfig(PluginConfigBase):
@@ -99,6 +131,9 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_label__ = "插件"
     __ui_icon__ = "undo"
     __ui_order__ = 0
+    __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
+        "en": {"title": "Plugin", "description": "Basic plugin settings."}
+    }
 
     enabled: bool = Field(
         default=True,
@@ -106,6 +141,7 @@ class PluginSectionConfig(PluginConfigBase):
         json_schema_extra={
             "label": "启用插件",
             "hint": "插件总开关",
+            **_ui_i18n("Enable plugin", "Master switch for the plugin."),
         },
     )
     config_version: str = Field(
@@ -116,6 +152,7 @@ class PluginSectionConfig(PluginConfigBase):
             "disabled": True,
             "label": "配置版本",
             "hint": "配置版本，勿改",
+            **_ui_i18n("Config version", "Do not edit."),
         },
     )
 
@@ -126,6 +163,9 @@ class RecallRuleConfig(PluginConfigBase):
     __ui_label__ = "撤回规则"
     __ui_icon__ = "shield"
     __ui_order__ = 1
+    __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
+        "en": {"title": "Recall rules", "description": "Who is allowed to recall which messages."}
+    }
 
     admin_users: list[str] = Field(
         default_factory=list,
@@ -133,6 +173,7 @@ class RecallRuleConfig(PluginConfigBase):
         json_schema_extra={
             "label": "管理员列表",
             "hint": "管理员可撤任何消息",
+            **_ui_i18n("Admin users", "Admins may recall any message; '123456' or 'qq:123456'."),
         },
     )
     users_can_recall_bot_messages: bool = Field(
@@ -141,6 +182,7 @@ class RecallRuleConfig(PluginConfigBase):
         json_schema_extra={
             "label": "允许撤回机器人的消息",
             "hint": "允许撤回机器人消息",
+            **_ui_i18n("Allow recalling bot messages", "Let users recall messages sent by the bot."),
         },
     )
     users_can_recall_own_messages: bool = Field(
@@ -149,6 +191,7 @@ class RecallRuleConfig(PluginConfigBase):
         json_schema_extra={
             "label": "允许撤回自己的消息",
             "hint": "允许撤回自己消息",
+            **_ui_i18n("Allow recalling own messages", "Let users recall their own messages."),
         },
     )
     self_recall_time_limit_sec: int = Field(
@@ -159,6 +202,7 @@ class RecallRuleConfig(PluginConfigBase):
         json_schema_extra={
             "label": "撤回时限（秒）",
             "hint": "撤回自身时限（秒）",
+            **_ui_i18n("Self-recall time limit (sec)", "Time window for recalling the bot's own messages."),
         },
     )
 
@@ -169,6 +213,9 @@ class AdapterApiConfig(PluginConfigBase):
     __ui_label__ = "适配器接口"
     __ui_icon__ = "cable"
     __ui_order__ = 2
+    __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
+        "en": {"title": "Adapter API", "description": "Which adapter action endpoint to call."}
+    }
 
     action_api: str = Field(
         default="adapter.napcat.action.call",
@@ -176,6 +223,30 @@ class AdapterApiConfig(PluginConfigBase):
         json_schema_extra={
             "label": "适配器 action API",
             "hint": "适配器 action 接口",
+            **_ui_i18n("Adapter action API", "Generic adapter action endpoint."),
+        },
+    )
+
+
+class RecallLimitConfig(PluginConfigBase):
+    """频率限制（limits 配置节）。"""
+
+    __ui_label__ = "频率限制"
+    __ui_icon__ = "timer"
+    __ui_order__ = 3
+    __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
+        "en": {"title": "Rate limit", "description": "Cooldown between recall attempts."}
+    }
+
+    cooldown_sec: int = Field(
+        default=10,
+        ge=0,
+        le=3600,
+        description="同一会话两次撤回操作之间的最小间隔（秒），0 表示不限制",
+        json_schema_extra={
+            "label": "冷却间隔（秒）",
+            "hint": "每会话冷却秒数",
+            **_ui_i18n("Cooldown (sec)", "Minimum interval per chat; 0 disables the limit."),
         },
     )
 
@@ -186,6 +257,7 @@ class MaiRecallConfig(PluginConfigBase):
     plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
     rules: RecallRuleConfig = Field(default_factory=RecallRuleConfig)
     adapter: AdapterApiConfig = Field(default_factory=AdapterApiConfig)
+    limits: RecallLimitConfig = Field(default_factory=RecallLimitConfig)
 
 
 class MaiRecallPlugin(MaiBotPlugin):
@@ -199,6 +271,7 @@ class MaiRecallPlugin(MaiBotPlugin):
         super().__init__()
         self._self_id = ""
         self._bot_role_cache: dict[str, tuple[str, float]] = {}
+        self._last_recall_at: dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # 生命周期（1.2.3 硬性要求，缺一即加载失败）
@@ -206,21 +279,24 @@ class MaiRecallPlugin(MaiBotPlugin):
 
     async def on_load(self) -> None:
         self.ctx.logger.info(
-            "麦麦撤回已加载：管理员 %d 人，自身消息撤回时限 %d 秒，适配器接口 %s",
+            "麦麦撤回已加载：插件配置管理员 %d 人（另叠加宿主权限名单），自身消息撤回时限 %d 秒，每会话冷却 %d 秒，适配器接口 %s",
             len(self.config.rules.admin_users),
             self.config.rules.self_recall_time_limit_sec,
+            max(0, int(self.config.limits.cooldown_sec)),
             self.config.adapter.action_api,
         )
 
     async def on_unload(self) -> None:
         self._self_id = ""
         self._bot_role_cache.clear()
+        self._last_recall_at.clear()
         self.ctx.logger.info("麦麦撤回已卸载")
 
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
         if scope == CONFIG_RELOAD_SCOPE_SELF:
             self._self_id = ""
             self._bot_role_cache.clear()
+            self._last_recall_at.clear()
             self.ctx.logger.info("麦麦撤回配置已热更新（version=%s）", version)
 
     # ------------------------------------------------------------------
@@ -233,6 +309,7 @@ class MaiRecallPlugin(MaiBotPlugin):
         detailed_description=(
             "撤回指定消息 ID 对应的消息（QQ 平台消息 ID，可能是负数）。\n"
             "使用条件：仅在用户明确要求撤回/删除某条消息时才调用，不要主动撤回消息。\n"
+            "限制：非管理员只能撤回当前会话内的消息，跨群/跨私聊的消息会被拒绝。\n"
             "参数：message_id（string，要撤回的消息 ID）；当用户引用/回复了某条消息并要求撤回"
             "但没有给出 ID 时，可以留空，插件会尝试撤回被引用的那条消息。\n"
             "返回：success 表示是否撤回成功，content 为结果说明；失败时 content 会给出具体原因"
@@ -257,10 +334,17 @@ class MaiRecallPlugin(MaiBotPlugin):
             target = self._extract_reply_target(kwargs) or ""
         if not target:
             return {"content": REASON_NO_TARGET, "success": False}
+        chat_key = self._chat_key(kwargs)
+        if self._cooldown_hit(chat_key):
+            self.ctx.logger.info("Tool recall_message(%s) 触发冷却（chat=%s）", target, chat_key)
+            return {"content": REASON_TOO_FREQUENT, "success": False}
+        requester = self._extract_requester(kwargs)
         ok, reason = await self._do_recall(
             target,
-            requester=self._extract_requester(kwargs),
-            is_admin=self._is_admin(self._extract_requester(kwargs), kwargs),
+            requester=requester,
+            is_admin=await self._is_admin(requester, kwargs),
+            stream_id=str(kwargs.get("stream_id") or "").strip(),
+            trigger_group=self._extract_trigger_group(kwargs),
         )
         self.ctx.logger.info("Tool recall_message(%s) -> %s", target, reason)
         return {"content": reason, "success": ok}
@@ -285,7 +369,17 @@ class MaiRecallPlugin(MaiBotPlugin):
             return True, "no target", True
 
         requester = self._extract_requester(kwargs)
-        ok, reason = await self._do_recall(target, requester=requester, is_admin=self._is_admin(requester, kwargs))
+        chat_key = self._chat_key(kwargs)
+        if self._cooldown_hit(chat_key):
+            reason = REASON_TOO_FREQUENT
+        else:
+            ok, reason = await self._do_recall(
+                target,
+                requester=requester,
+                is_admin=await self._is_admin(requester, kwargs),
+                stream_id=stream_id,
+                trigger_group=self._extract_trigger_group(kwargs),
+            )
         self.ctx.logger.info("Command /撤回(%s) by %s -> %s", target, requester or "unknown", reason)
         await self.ctx.send.text(reason, stream_id)
         return True, reason, True
@@ -294,8 +388,16 @@ class MaiRecallPlugin(MaiBotPlugin):
     # 撤回核心流程
     # ------------------------------------------------------------------
 
-    async def _do_recall(self, target_raw: str, *, requester: str, is_admin: bool) -> tuple[bool, str]:
-        """撤回核心流程：解析目标 → 权限判定 → 时间限制 → 调用协议端撤回。
+    async def _do_recall(
+        self,
+        target_raw: str,
+        *,
+        requester: str,
+        is_admin: bool,
+        stream_id: str = "",
+        trigger_group: str = "",
+    ) -> tuple[bool, str]:
+        """撤回核心流程：解析目标 → 会话作用域 → 权限判定 → 时间限制 → 调用协议端撤回。
 
         返回 (是否成功, 给用户看的文案)；失败时文案即失败原因。
         """
@@ -311,6 +413,20 @@ class MaiRecallPlugin(MaiBotPlugin):
         msg_time = parse_timestamp(info.get("time"))
         group_id = str(info.get("group_id") or "").strip()
         rules = self.config.rules
+
+        # 会话作用域绑定：非管理员只能撤回触发会话内的消息（管理员豁免）。
+        if not is_admin and not await self._scope_allowed(
+            target_raw,
+            pid_text=pid_text,
+            target_group=group_id,
+            stream_id=stream_id,
+            trigger_group=trigger_group,
+        ):
+            self.ctx.logger.warning(
+                "撤回 %s 被拒绝：目标消息不属于触发会话（trigger_group=%r，stream=%r）",
+                target_raw, trigger_group, stream_id,
+            )
+            return False, REASON_SCOPE_MISMATCH
 
         self_id = plain_id(await self._get_self_id())
         is_bot_own = bool(self_id) and sender_id == self_id
@@ -339,8 +455,49 @@ class MaiRecallPlugin(MaiBotPlugin):
             return False, REASON_NOT_FOUND
         return await self._delete_platform_message(pid_text, is_bot_own=is_bot_own)
 
+    async def _scope_allowed(
+        self,
+        target_text: str,
+        *,
+        pid_text: str,
+        target_group: str,
+        stream_id: str,
+        trigger_group: str,
+    ) -> bool:
+        """校验目标消息是否属于触发会话（仅对非管理员调用）。
+
+        群聊触发：目标消息的群号必须与触发群一致；私聊触发：目标必须同属当前
+        私聊流（经宿主消息查询比对）。归属查询不到时一律拒绝（fail-closed）。
+        """
+        target_group = str(target_group or "").strip()
+        if trigger_group:
+            return target_group == trigger_group
+        # 触发会话是私聊（或取不到群号）：目标必须也是私聊且会话流一致
+        if target_group or not stream_id:
+            return False
+        for mid in (target_text, pid_text):
+            if not mid:
+                continue
+            target_stream = await self._get_db_stream_id(mid)
+            if target_stream:
+                return target_stream == stream_id
+        return False
+
+    async def _get_db_stream_id(self, message_id: str) -> str:
+        """从宿主消息记录里取该消息所属会话流 ID；取不到返回空字符串。"""
+        msg = await self._get_db_message(message_id)
+        if not msg:
+            return ""
+        message_info = msg.get("message_info") if isinstance(msg.get("message_info"), dict) else {}
+        for source in (msg, message_info):
+            for key in ("session_id", "stream_id", "chat_id", "chat_stream_id"):
+                value = str(source.get(key) or "").strip()
+                if value:
+                    return value
+        return ""
+
     async def _delete_platform_message(self, pid_text: str, *, is_bot_own: bool) -> tuple[bool, str]:
-        """调用适配器 delete_msg 执行撤回，并把失败翻译成可读原因。"""
+        """调用适配器 delete_msg 执行撤回，并把失败翻译成可读原因（不回显原始错误）。"""
         try:
             message_id = int(pid_text)
         except ValueError:
@@ -350,10 +507,13 @@ class MaiRecallPlugin(MaiBotPlugin):
             return False, self._adapter_error_text(host_err)
         if napcat_ok(resp):
             return True, REASON_SUCCESS
+        if napcat_pending(resp):
+            # status=async 仅表示协议端已受理、结果未知，不做成功保证
+            self.ctx.logger.info("delete_msg(%s) 已被协议端受理（status=async），结果待确认", pid_text)
+            return False, REASON_ASYNC_PENDING
         self.ctx.logger.warning("delete_msg(%s) 被协议端拒绝：%s", pid_text, resp)
-        fallback = f"撤回失败：协议端返回 retcode={resp.get('retcode')}。"
         wording = resp.get("wording") or resp.get("message") or resp.get("error")
-        return False, translate_delete_error(wording, fallback=fallback, target_is_bot_own=is_bot_own)
+        return False, translate_delete_error(wording, fallback=REASON_REJECTED_GENERIC, target_is_bot_own=is_bot_own)
 
     # ------------------------------------------------------------------
     # 目标消息解析
@@ -373,7 +533,8 @@ class MaiRecallPlugin(MaiBotPlugin):
                 if db_msg:
                     info = self._info_from_db(db_msg)
             if info is None:
-                return "", None, host_err  # 适配器不可用等宿主层错误，原样上报
+                # 适配器不可用等宿主层错误：原文已在日志，对外只给分类文案
+                return "", None, self._adapter_error_text(host_err)
             return text, info, ""
 
         # 非纯数字 ID（宿主内部消息 ID）：先查库换出平台消息 ID
@@ -469,13 +630,19 @@ class MaiRecallPlugin(MaiBotPlugin):
             self.ctx.logger.warning("适配器 API %s(%s) 返回失败：%s", api_name, action_name, error)
             return None, error
         if not isinstance(resp, dict):
-            return None, f"适配器返回了无法识别的数据：{type(resp).__name__}"
+            return None, "适配器返回了无法识别的数据"
         return resp, ""
 
     @staticmethod
     def _adapter_error_text(host_err: str) -> str:
-        detail = str(host_err or "").strip() or "适配器调用失败"
-        return f"撤回接口调用失败：{detail}。请确认平台适配器（如 Napcat 适配器）已安装并启用。"
+        """把适配器/宿主层错误转成给用户看的分类文案；原始错误只进日志，不回显。"""
+        detail = str(host_err or "").strip()
+        lower = detail.lower()
+        if "denied" in lower or "e_capability" in lower or "权限" in detail:
+            return "撤回接口调用失败：能力调用被拒绝，请检查插件与适配器配置。"
+        if "timeout" in lower or "timed out" in lower or "超时" in detail:
+            return "撤回接口调用失败：适配器响应超时，请稍后再试。"
+        return REASON_ADAPTER_FAILED
 
     async def _get_self_id(self) -> str:
         """查询并缓存机器人自己的账号 ID（get_login_info）。"""
@@ -517,8 +684,38 @@ class MaiRecallPlugin(MaiBotPlugin):
         return role
 
     # ------------------------------------------------------------------
-    # 上下文提取
+    # 上下文提取与频控
     # ------------------------------------------------------------------
+
+    def _chat_key(self, kwargs: dict[str, Any]) -> str:
+        """取频控用的会话键：优先会话流 ID，其次群号，再次触发者。"""
+        return (
+            str(kwargs.get("stream_id") or "").strip()
+            or self._extract_trigger_group(kwargs)
+            or self._extract_requester(kwargs)
+            or "unknown"
+        )
+
+    def _cooldown_hit(self, chat_key: str) -> bool:
+        """每会话冷却：间隔内再次触发返回 True，并记录本次放行时间。"""
+        limit = max(0, int(self.config.limits.cooldown_sec))
+        if limit <= 0:
+            return False
+        now = time.time()
+        if now - self._last_recall_at.get(chat_key, 0.0) < limit:
+            return True
+        self._last_recall_at[chat_key] = now
+        return False
+
+    @staticmethod
+    def _extract_trigger_group(kwargs: dict[str, Any]) -> str:
+        """从组件 kwargs 里取触发会话的群号（私聊为空字符串）。"""
+        message = kwargs.get("message") if isinstance(kwargs.get("message"), dict) else {}
+        message_info = message.get("message_info") if isinstance(message.get("message_info"), dict) else {}
+        group_info = message.get("group_info") if isinstance(message.get("group_info"), dict) else {}
+        if not group_info and isinstance(message_info.get("group_info"), dict):
+            group_info = message_info["group_info"]
+        return str(group_info.get("group_id") or "").strip()
 
     @staticmethod
     def _extract_requester(kwargs: dict[str, Any]) -> str:
@@ -531,15 +728,30 @@ class MaiRecallPlugin(MaiBotPlugin):
         user_id = kwargs.get("user_id") or user_info.get("user_id") or ""
         return plain_id(user_id)
 
-    def _is_admin(self, requester: str, kwargs: dict[str, Any]) -> bool:
-        """判定触发者是否管理员：本地控制台天然放行，其余比对配置的管理员列表。"""
+    async def _is_admin(self, requester: str, kwargs: dict[str, Any]) -> bool:
+        """判定触发者是否管理员：本地控制台天然放行（is_local_operator 短路）。
+
+        其余触发者比对 宿主 `plugin.permission` 名单 ∪ 插件 [rules] admin_users
+        （经 plain_id 归一去重，'qq:10001' 与 '10001' 视为同一人）。
+        """
         if kwargs.get("is_local_operator"):
             return True
         if not requester:
             return False
-        admins = {plain_id(u) for u in self.config.rules.admin_users}
-        admins.discard("")
-        return requester in admins
+        # 触发者 ID 兜底归一（正常路径已在 _extract_requester 去前缀）
+        return plain_id(requester) in await self._collect_admins()
+
+    async def _collect_admins(self) -> list[str]:
+        """管理员名单 = 宿主 `plugin.permission` ∪ 插件 [rules] admin_users，按纯 ID 去重。
+
+        宿主名单读取失败时降级为仅插件配置（debug 日志，不抛异常）。
+        """
+        try:
+            perms = await self.ctx.config.get("plugin.permission", None)
+        except Exception as exc:
+            self.ctx.logger.debug("读取宿主 plugin.permission 失败，降级为仅插件配置管理员：%s", exc)
+            perms = None
+        return collect_admins(perms, self.config.rules.admin_users)
 
     @staticmethod
     def _extract_reply_target(kwargs: dict[str, Any]) -> str | None:
