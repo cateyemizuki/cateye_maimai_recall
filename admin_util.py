@@ -1,14 +1,11 @@
-"""cateye 管理员判定统一模块（参考实现，随插件复制分发）。
+"""cateye 管理员判定统一模块（随插件复制分发）。
 
-来源：cateye_common（2026-09-29 二轮统一，提炼自 cateye_scp_article/scp_core.py）；
-本副本复制自 cateye_common/admin_util.py，随 cateye_maimai_recall 插件分发。
-
-统一规则（用户裁决）：
-- 管理员 = 宿主管理员 ∪ 插件配置管理员，按纯 ID 去重；
-- 宿主侧来源：`ctx.config.get("plugin.permission", ...)`（宿主插件权限名单，
-  与命令权限同源）；读取失败降级为仅插件配置（debug 日志，不抛异常）；
-- 输入默许裸 QQ 号：带平台前缀（'qq:10001'）与裸号（'10001'）视为同一人，
-  文档无需强调此兼容行为。
+规则（0.2.0 起）：
+- 管理员名单 = 宿主 `plugin.permission` ∪ 插件 `[rules] admin_users`；
+- 插件 `admin_users` 是可选可见配置，默认留空表示自动跟随宿主；
+- 两个来源都按纯 ID 去重（`qq:10001` 与 `10001` 视为同一人）；
+- 宿主名单读取失败时只保留显式配置的插件管理员；两者都为空时返回空列表
+  （fail-closed，绝不放行所有人）。
 """
 
 from __future__ import annotations
@@ -35,31 +32,41 @@ def plain_id(entry: Any) -> str:
     return s if s.isdigit() else ""
 
 
-def collect_admins(host_permissions: Any, config_admins: Any) -> List[str]:
-    """合并宿主管理员与插件配置管理员，按纯 ID 去重。
+def _unwrap(source: Any) -> Any:
+    """兼容 SDK 未解包时的 ``{"success":..., "value": [...]}`` 形态。"""
+    if isinstance(source, dict):
+        for key in ("value", "permissions", "permission", "admins", "users"):
+            if key in source:
+                return source[key]
+        if "user_id" in source or "id" in source:
+            return [source]
+    return source
 
-    返回去重后的纯 ID 列表（宿主条目在前，顺序稳定）。
-    """
+
+def dedup_admins(entries: Any) -> List[str]:
+    """把任意形态的管理员条目归一为纯 ID 并去重（保持首次出现顺序）。"""
+    entries = _unwrap(entries)
+    if isinstance(entries, (str, int)):
+        entries = [entries]
+    if not isinstance(entries, Iterable) or isinstance(entries, (bytes, bytearray)):
+        return []
     out: List[str] = []
-    seen: set = set()
-    for source in (host_permissions, config_admins):
-        if isinstance(source, str):
-            source = [source]
-        if not isinstance(source, Iterable) or isinstance(source, (bytes, bytearray)):
-            continue
-        for entry in source:
-            pid = plain_id(entry)
-            if not pid or pid in seen:
-                continue
+    seen: set[str] = set()
+    for entry in entries:
+        pid = plain_id(entry)
+        if pid and pid not in seen:
             seen.add(pid)
             out.append(pid)
     return out
 
 
-async def host_admins(ctx: Any) -> List[str]:
-    """读取宿主插件权限名单；失败返回空列表（调用方降级为仅插件配置）。"""
-    try:
-        perms = await ctx.config.get("plugin.permission", None)
-    except Exception:
-        return []
-    return [p for p in (plain_id(x) for x in (perms or [])) if p]
+def merge_admins(*sources: Any) -> List[str]:
+    """合并多个管理员来源，按纯 ID 去重；来源为空时返回空列表。"""
+    out: List[str] = []
+    seen: set[str] = set()
+    for source in sources:
+        for pid in dedup_admins(source):
+            if pid not in seen:
+                seen.add(pid)
+                out.append(pid)
+    return out

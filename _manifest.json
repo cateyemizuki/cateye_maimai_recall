@@ -1,9 +1,9 @@
 {
   "manifest_version": 2,
   "id": "github.cateye.maimai-recall",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "name": "麦麦撤回",
-  "description": "为机器人提供消息撤回能力：LLM 工具按消息 ID 撤回指定消息；引用一条消息发送「/撤回」即可撤回被引用的消息；失败时返回具体原因（权限不足、超过时间限制、消息不存在等）。",
+  "description": "为机器人提供消息撤回能力：LLM 工具可在权限校验后实际撤回（enable_llm_tool 默认开启，关闭后不注册）；引用一条消息发送「/撤回」即可撤回；「/撤回调试」可查看机器人与目标用户的群身份并判断能否撤回；管理员始终可用，普通用户可按插件开关撤回本会话内机器人/自己的消息；按 bot 的 QQ 群身份与私聊规则返回确切原因。",
   "author": { "name": "cateye", "url": "https://github.com/cateyemizuki" },
   "license": "MIT",
   "urls": {
@@ -15,7 +15,7 @@
   "host_application": { "min_version": "1.0.0", "max_version": "1.99.99" },
   "sdk": { "min_version": "2.5.0", "max_version": "2.99.99" },
   "dependencies": [],
-  "capabilities": ["send.text", "api.call", "message.get_by_id", "config.get"],
+  "capabilities": ["send.text", "api.call", "message.get_by_id", "message.get_recent", "config.get"],
   "i18n": { "default_locale": "zh-CN" },
   "plugin_type": "tool",
   "display": { "icon": { "type": "lucide", "value": "undo-2" } }
